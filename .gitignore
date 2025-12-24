@@ -1,0 +1,3 @@
+old/
+lab*/**cache**
+lab*/.venv/
