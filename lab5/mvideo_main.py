@@ -1,4 +1,3 @@
-# lesson5_mvideo_main.py
 import os
 import re
 from datetime import datetime
@@ -8,6 +7,7 @@ import scrapy
 from pymongo import MongoClient, ASCENDING
 from scrapy_playwright.page import PageMethod
 
+
 BASE_URL = "https://www.mvideo.ru/"
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -15,6 +15,14 @@ MONGO_DB = os.getenv("MONGO_DB", "parsing_hw")
 MONGO_COLLECTION = os.getenv("MONGO_COLLECTION_MVIDEO", "mvideo_trending")
 
 PRICE_RE = re.compile(r"(\d[\d\s\xa0]*?)\s*руб", re.IGNORECASE)
+
+
+def abort_request(request) -> bool:
+    """
+    Ускоряем загрузку: не тянем картинки/шрифты/медиа.
+    """
+    return request.resource_type in {"image", "font", "media"}
+
 
 def _to_int_price(s: str) -> int | None:
     if not s:
@@ -25,22 +33,20 @@ def _to_int_price(s: str) -> int | None:
     except ValueError:
         return None
 
+
 def extract_prices_from_html(html_text: str) -> list[int]:
-    """
-    Достаём цены по вхождениям 'NNN руб' из HTML.
-    Обычно первая — текущая, вторая (если есть) — старая/перечёркнутая.
-    """
     found = []
     for m in PRICE_RE.finditer(html_text):
         p = _to_int_price(m.group(1))
         if p is not None:
             found.append(p)
-    # немного чистим дубли
+    
     uniq = []
     for x in found:
         if not uniq or uniq[-1] != x:
             uniq.append(x)
     return uniq
+
 
 class MongoPipeline:
     def open_spider(self, spider):
@@ -48,12 +54,14 @@ class MongoPipeline:
         self.col = self.client[MONGO_DB][MONGO_COLLECTION]
         self.col.create_index([("url", ASCENDING)], unique=True)
         self.col.create_index([("product_id", ASCENDING)])
+        self.col.create_index([("scraped_at", ASCENDING)])
 
     def close_spider(self, spider):
         self.client.close()
 
     def process_item(self, item, spider):
         item = dict(item)
+        # upsert по url, чтобы при повторах не плодить дубли
         self.col.update_one(
             {"url": item["url"]},
             {"$set": item, "$setOnInsert": {"created_at": datetime.utcnow()}},
@@ -61,11 +69,11 @@ class MongoPipeline:
         )
         return item
 
+
 class MvideoTrendingSpider(scrapy.Spider):
     name = "mvideo_trending"
 
     custom_settings = {
-        # scrapy-playwright конфиг (официально используется DOWNLOAD_HANDLERS + AsyncioSelectorReactor) :contentReference[oaicite:1]{index=1}
         "DOWNLOAD_HANDLERS": {
             "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
             "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
@@ -74,47 +82,67 @@ class MvideoTrendingSpider(scrapy.Spider):
         "PLAYWRIGHT_BROWSER_TYPE": "chromium",
         "PLAYWRIGHT_LAUNCH_OPTIONS": {"headless": True},
 
+        "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": 60000,
+        "PLAYWRIGHT_DEFAULT_TIMEOUT": 60000,
+
+        "PLAYWRIGHT_ABORT_REQUEST": abort_request,
+
         "ITEM_PIPELINES": {__name__ + ".MongoPipeline": 300},
         "LOG_LEVEL": "INFO",
         "ROBOTSTXT_OBEY": True,
-        "DOWNLOAD_TIMEOUT": 60,
+        "DOWNLOAD_TIMEOUT": 90,
+        "RETRY_TIMES": 2,
     }
 
-    def start_requests(self):
+    async def start(self):
         yield scrapy.Request(
             BASE_URL,
             meta={
                 "playwright": True,
+                "playwright_include_page": True,
                 "playwright_page_methods": [
-                    PageMethod("wait_for_load_state", "networkidle"),
-                    # прокрутка вниз, чтобы догрузились карусели/блоки
+                    PageMethod("wait_for_load_state", "domcontentloaded"),
+                    PageMethod("wait_for_timeout", 1500),
+
                     PageMethod("evaluate", "window.scrollTo(0, document.body.scrollHeight)"),
-                    PageMethod("wait_for_timeout", 1200),
+                    PageMethod("wait_for_timeout", 1500),
                     PageMethod("evaluate", "window.scrollTo(0, document.body.scrollHeight)"),
-                    PageMethod("wait_for_timeout", 1200),
-                    # ждём, что появятся ссылки на товары
-                    PageMethod("wait_for_selector", 'a[href*="/products/"]', timeout=20000),
+                    PageMethod("wait_for_timeout", 1500),
+
+                    PageMethod("wait_for_selector", 'a[href*="/products/"]', timeout=60000),
                 ],
             },
             callback=self.parse_home,
+            errback=self.errback_close_page,
+            dont_filter=True,
         )
 
-    def parse_home(self, response):
-        # Ищем секцию, где есть заголовок "В тренде"
+    async def errback_close_page(self, failure):
+        """
+        Если Playwright упал, обязательно закрываем page, иначе будут утечки.
+        """
+        page = failure.request.meta.get("playwright_page")
+        if page:
+            await page.close()
+        self.logger.error("Request failed: %r", failure)
+
+    async def parse_home(self, response):
+        page = response.meta.get("playwright_page")
+        if page:
+            await page.close()
+
         section = response.xpath(
             '//*[self::section or self::div]'
             '[.//*[self::h1 or self::h2 or self::h3][contains(normalize-space(.), "В тренде")]]'
         )
-
+        root = section[0] if section else response
         if section:
-            root = section[0]
             self.logger.info('Found section "В тренде"')
         else:
-            # fallback: если верстка поменялась/не успело догрузиться
-            root = response
             self.logger.warning('Section "В тренде" not found, fallback to whole page')
 
         hrefs = root.xpath('.//a[contains(@href, "/products/")]/@href').getall()
+
         urls = []
         seen = set()
         for h in hrefs:
@@ -124,15 +152,17 @@ class MvideoTrendingSpider(scrapy.Spider):
             seen.add(u)
             urls.append(u)
 
-        # чтобы было что показать преподу быстро — ограничим разумным числом
+        self.logger.info("Product links extracted: %d", len(urls))
+
+        # Ограничим число товаров для ДЗ
         for u in urls[:30]:
             yield scrapy.Request(u, callback=self.parse_product)
 
     def parse_product(self, response):
-        title = (response.xpath("normalize-space(//h1)") or "").get()
+        title = response.xpath("normalize-space(//h1)").get() or ""
         url = response.url
 
-        # product_id обычно в конце URL после последнего дефиса
+        # product_id часто в конце после дефиса
         m = re.search(r"-([0-9]{6,})/?$", url)
         product_id = m.group(1) if m else None
 
@@ -143,17 +173,17 @@ class MvideoTrendingSpider(scrapy.Spider):
         yield {
             "source": "mvideo.ru",
             "collection": "В тренде",
-            "title": title,
+            "title": title.strip(),
             "url": url,
             "product_id": product_id,
             "price_current_rub": current_price,
             "price_old_rub": old_price,
             "scraped_at": datetime.utcnow(),
-            "project_tag": "lesson5_scrapy_mvideo_trending",
+            "project_tag": "scrapy_mvideo_trending",
         }
 
+
 if __name__ == "__main__":
-    # удобный запуск одной командой:
-    # python lesson5_mvideo_main.py
+    # удобный запуск одним файлом
     from scrapy.cmdline import execute
     execute(["scrapy", "runspider", __file__])
